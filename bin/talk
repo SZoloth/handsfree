@@ -1,0 +1,43 @@
+#!/bin/zsh
+# Voice session with Claude — speaks via local Kokoro, listens via local Whisper.
+#
+# Fast path: wakes the persistent `imessage-bridge` Claude session (same brain
+# that handles iMessage), so voice starts in under a second and shares memory
+# with the phone channel. Falls back to a cold session if the bridge is down.
+#
+# Usage: talk            -> voice conversation
+#        talk "<task>"   -> voice conversation seeded with a starting task
+
+BRIDGE_SESSION="${TALK_BRIDGE_SESSION:-imessage-bridge}"
+
+PROMPT="${1:-}"
+VOICE_CMD="Start a voice conversation with me now via voicemode converse. Follow the voice conversation contract in CLAUDE.md."
+if [[ -n "$PROMPT" ]]; then
+  VOICE_CMD="$VOICE_CMD First task: $PROMPT"
+fi
+
+# Fast path: bridge session is alive and its prompt is empty (never clobber a draft).
+# The REPL renders "❯" + non-breaking space when empty; a draft adds alphanumerics.
+if tmux has-session -t "$BRIDGE_SESSION" 2>/dev/null; then
+  if tmux capture-pane -t "$BRIDGE_SESSION" -p | grep -qE '^❯[^A-Za-z0-9]*$'; then
+    tmux send-keys -t "$BRIDGE_SESSION" "$VOICE_CMD"
+    sleep 0.4   # let the REPL's paste detection settle, else Enter is swallowed
+    tmux send-keys -t "$BRIDGE_SESSION" Enter
+    exit 0
+  fi
+fi
+
+# Cold path: fresh session
+if [[ -t 0 ]]; then
+  exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+    -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
+    claude "$VOICE_CMD"
+else
+  # No TTY (Siri Shortcut, launchd): headless print-mode session. The converse
+  # tool loops within the single turn, so the conversation continues until the
+  # goodbye condition ends it.
+  mkdir -p "$HOME/.local/state/talk"
+  exec env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+    -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
+    claude -p "$VOICE_CMD" >> "$HOME/.local/state/talk/talk.log" 2>&1
+fi

@@ -1,0 +1,47 @@
+#!/bin/zsh
+# Manage the persistent Claude Code session that backs both the iMessage
+# channel and the voice fast path. One brain, two doors.
+#
+# Usage: bridge start|stop|restart|status
+
+SESSION="${TALK_BRIDGE_SESSION:-imessage-bridge}"
+CHANNEL="plugin:imessage@claude-plugins-official"
+
+start() {
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "bridge already running (tmux: $SESSION)"
+    return 0
+  fi
+  tmux new-session -d -s "$SESSION" -c "$HOME" \
+    "env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+     -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
+     claude --channels $CHANNEL"
+  sleep 8
+  if tmux capture-pane -t "$SESSION" -p | grep -qi "channel"; then
+    echo "bridge up: iMessage channel connected (tmux: $SESSION)"
+  else
+    echo "bridge started but channel banner not seen — check: tmux attach -t $SESSION"
+    return 1
+  fi
+}
+
+stop() {
+  tmux kill-session -t "$SESSION" 2>/dev/null && echo "bridge stopped" || echo "bridge not running"
+}
+
+status() {
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "bridge running (tmux: $SESSION)"
+    tmux capture-pane -t "$SESSION" -p | tail -4
+  else
+    echo "bridge not running"
+  fi
+}
+
+case "${1:-status}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; sleep 1; start ;;
+  status)  status ;;
+  *) echo "usage: bridge start|stop|restart|status"; exit 1 ;;
+esac
