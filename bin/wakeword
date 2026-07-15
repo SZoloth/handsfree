@@ -59,13 +59,38 @@ start() {
   fi
 }
 
+is_launchd_loaded() {
+  launchctl list 2>/dev/null | grep -q "	${PLIST_LABEL}\$"
+}
+
+# BLOCKER FIX (review round 1): a bare `kill` here was silently useless once
+# `install-launchd` had run — KeepAlive=true means launchd resurrects the
+# process within ~1-10s of any exit that isn't preceded by an unload. An
+# always-on-mic daemon whose `stop` doesn't actually stop it is a privacy
+# bug, not just a rough edge. `stop` now always checks launchd first and
+# unloads the job there (which both kills the current process AND tells
+# launchd to stop restarting it), then separately checks for an orphaned
+# manually-started process. See "launchd + stop semantics" in
+# wakeword/README.md before touching this again.
 stop() {
+  local did_something=0
+
+  if is_launchd_loaded; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null
+    echo "unloaded launchd job: $PLIST_LABEL (this also stops the running process)"
+    did_something=1
+    sleep 1
+  fi
+
   local pid
   pid="$(running_pid)"
   if [[ -n "$pid" ]]; then
     kill "$pid" 2>/dev/null
-    echo "wakeword stopped (was pid $pid)"
-  else
+    echo "stopped orphan process (pid $pid, was not under launchd)"
+    did_something=1
+  fi
+
+  if [[ "$did_something" -eq 0 ]]; then
     echo "wakeword not running"
   fi
 }
@@ -77,6 +102,9 @@ status() {
     echo "wakeword running (pid $pid)"
   else
     echo "wakeword not running"
+  fi
+  if is_launchd_loaded; then
+    echo "launchd job loaded: $PLIST_LABEL (KeepAlive — will auto-restart; use 'wakeword stop' to actually stop it)"
   fi
   if [[ -f "$LOG_PATH" ]]; then
     echo "--- last detections ($LOG_PATH) ---"
@@ -122,7 +150,7 @@ install_launchd() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/samzoloth/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
     </dict>
 </dict>
 </plist>
