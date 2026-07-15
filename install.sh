@@ -7,8 +7,8 @@ set -e
 REPO="$(cd "$(dirname "$0")" && pwd)"
 say_step() { print -P "%F{cyan}==> $1%f" }
 
-say_step "Checking dependencies (claude, uv, tmux, ffmpeg)"
-for dep in claude uvx tmux ffmpeg; do
+say_step "Checking dependencies (claude, uv, swift, tmux, ffmpeg)"
+for dep in claude uv uvx swift tmux ffmpeg; do
   command -v "$dep" >/dev/null || { echo "MISSING: $dep — install it first"; exit 1; }
 done
 
@@ -17,6 +17,20 @@ if claude mcp list 2>/dev/null | grep -q "^voicemode"; then
   echo "    already registered"
 else
   claude mcp add --scope user voicemode -- uvx --from voice-mode voicemode
+fi
+
+say_step "Building the echo-cancelled audio helper"
+swift build -c release
+
+say_step "Installing the local barge-in daemon and test dependencies"
+uv sync --project "$REPO" --extra test
+
+say_step "Registering the handsfree barge-in MCP at user scope"
+if claude mcp get handsfree 2>/dev/null | grep -Fq "$REPO"; then
+  echo "    already registered"
+else
+  claude mcp remove --scope user handsfree >/dev/null 2>&1 || true
+  claude mcp add --scope user handsfree -- uv run --project "$REPO" handsfree-bargein
 fi
 
 say_step "Installing Whisper STT (port 2022) and Kokoro TTS (port 8880)"
@@ -77,7 +91,7 @@ else
 fi
 
 say_step "Manual steps that remain"
-cat <<'EOF'
+cat <<EOF
   1. Add the two contracts from contracts/voice-contracts.md to ~/CLAUDE.md
      (edit the phone number placeholder). They govern how Claude behaves by
      voice and over iMessage.
@@ -91,6 +105,8 @@ cat <<'EOF'
      automated install above, because bridge start fails until the
      iMessage plugin from step 2 is in place.)
   3. First mic use pops a macOS microphone permission prompt — click Allow.
+     Then verify Apple's voice-processing engine directly:
+       $REPO/.build/release/handsfree-audio-helper --probe
   4. iPhone: Settings -> Notifications -> Announce Notifications -> Messages ON
      (makes bridge replies fully eyes-free on AirPods).
   5. Say "Hey Siri, talk to Claude" once; approve the first-run prompt if asked.

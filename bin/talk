@@ -11,7 +11,7 @@
 BRIDGE_SESSION="${TALK_BRIDGE_SESSION:-imessage-bridge}"
 
 PROMPT="${1:-}"
-VOICE_CMD="Start a voice conversation with me now via voicemode converse. Follow the voice conversation contract in CLAUDE.md."
+VOICE_CMD="Start a voice conversation with me now. Prefer the handsfree speak_and_listen MCP tool for each spoken turn; if it is unavailable or reports a helper failure, use voicemode converse. Follow the voice conversation contract in CLAUDE.md."
 if [[ -n "$PROMPT" ]]; then
   VOICE_CMD="$VOICE_CMD First task: $PROMPT"
 fi

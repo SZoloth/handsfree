@@ -70,6 +70,25 @@ prompts, one iPhone setting).
 | `bridge install-launchd` | One-time: bridge survives reboot (watchdog checks every 5 min) |
 | Say "goodbye" / "stop" | Voice loop ends cleanly |
 
+## Interrupt while the assistant speaks
+
+The `handsfree` MCP tool adds barge-in without changing VoiceMode. Kokoro still
+generates the WAV and VoiceMode still records, transcribes, and detects the end
+of your reply. During assistant playback, a Swift helper owns both sides of one
+`AVAudioEngine`: it renders the WAV, captures the microphone with Apple's voice
+processing enabled, and sends the echo-cancelled mic stream to Silero VAD. Five
+consecutive voiced frames stop the player. The helper closes its mic tap before
+VoiceMode opens its listener.
+
+Run `./install.sh`, approve the first microphone prompt, and start a new Claude
+Code session so it discovers `mcp__handsfree__speak_and_listen`. If the helper
+or MCP server is unavailable, `talk` tells Claude to use the existing
+`mcp__voicemode__converse` path. The fallback remains half-duplex.
+
+The v1 handoff can clip roughly the first 100–300 ms of speech after an
+interruption. See `plans/barge-in-verify.md` for the acoustic checks that need a
+person in the room.
+
 ## Behavior contracts
 
 `contracts/voice-contracts.md` is the canonical copy of the two CLAUDE.md

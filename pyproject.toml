@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "handsfree-bargein"
+version = "0.1.0"
+description = "Local echo-cancelled barge-in wrapper for VoiceMode"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastmcp>=3.4,<4",
+  "httpx>=0.28,<1",
+  "onnxruntime>=1.24,<2",
+  "silero-vad>=6.2.1,<7",
+  "voice-mode==8.11.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<10"]
+
+[project.scripts]
+handsfree-bargein = "bargein.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bargein"]
+
+[tool.pytest.ini_options]
+testpaths = ["bargein/tests"]
+markers = ["latency: real-time synthetic loopback latency check"]

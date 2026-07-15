@@ -1,0 +1,53 @@
+#!/bin/zsh
+set -euo pipefail
+
+REPO="${0:A:h:h}"
+cd "$REPO"
+
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON_BIN="$PYTHON"
+elif [[ -x "$REPO/.venv/bin/python" ]]; then
+  PYTHON_BIN="$REPO/.venv/bin/python"
+else
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+echo "[1/5] Build Swift helper"
+if [[ "${HANDSFREE_SWIFT_DISABLE_SANDBOX:-0}" == "1" ]]; then
+  CLANG_MODULE_CACHE_PATH="$REPO/.build/clang-module-cache" \
+  SWIFTPM_MODULECACHE_OVERRIDE="$REPO/.build/swift-module-cache" \
+    swift build --disable-sandbox -c release
+else
+  swift build -c release
+fi
+
+echo "[2/5] Run Python tests and measured loopback latency"
+"$PYTHON_BIN" -m pytest bargein/tests -q -s
+
+echo "[3/5] Compile Python modules"
+PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/handsfree-bargein-pycache}" \
+  "$PYTHON_BIN" -m compileall -q bargein
+
+echo "[4/5] Audit AEC ownership"
+if rg -n "sounddevice|NonBlockingAudioPlayer" bargein Sources; then
+  echo "FAIL: a direct PortAudio playback path is reachable from barge-in code" >&2
+  exit 1
+fi
+echo "OK: barge-in code contains no direct sounddevice playback path"
+
+echo "[5/5] Check local TTS/STT regression when services are running"
+if curl -fsS --max-time 2 http://127.0.0.1:8880/health >/dev/null \
+  && curl -fsS --max-time 2 http://127.0.0.1:2022/health >/dev/null; then
+  curl -fsS --max-time 15 http://127.0.0.1:8880/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model":"kokoro","input":"Handsfree barge in verified.","voice":"af_sky","response_format":"wav"}' \
+    -o /tmp/handsfree-bargein-verify.wav
+  curl -fsS --max-time 15 http://127.0.0.1:2022/v1/audio/transcriptions \
+    -F file=@/tmp/handsfree-bargein-verify.wav -F model=whisper-1 \
+    | grep -qi "verified"
+  echo "OK: Kokoro to Whisper round trip"
+else
+  echo "SKIP: Kokoro or Whisper health endpoint is down"
+fi
+
+echo "Automated verification complete. Run the MANUAL steps in plans/barge-in-verify.md."
