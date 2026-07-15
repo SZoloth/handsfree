@@ -2,10 +2,18 @@
 # Manage the persistent Claude Code session that backs both the iMessage
 # channel and the voice fast path. One brain, two doors.
 #
-# Usage: bridge start|stop|restart|status
+# Usage: bridge start|stop|restart|status|install-launchd|uninstall-launchd
 
 SESSION="${TALK_BRIDGE_SESSION:-imessage-bridge}"
 CHANNEL="plugin:imessage@claude-plugins-official"
+
+# Resolve this script's absolute path so the launchd plist calls the real
+# file no matter what directory `bridge` was invoked from.
+SELF="${0:A}"
+
+PLIST_LABEL="com.handsfree.bridge"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+LOG_DIR="$HOME/Library/Logs/handsfree"
 
 start() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -17,10 +25,24 @@ start() {
      -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
      claude --channels $CHANNEL"
   sleep 8
-  if tmux capture-pane -t "$SESSION" -p | grep -qi "channel"; then
+  # The channel connection banner this used to grep for no longer appears in
+  # current Claude Code splash screens (verified against v2.1.210 — no
+  # "channel" text on startup, and `--channels` isn't even a documented flag
+  # anymore). The channel mechanism itself is unchanged: claude-channel-cli
+  # is a globally registered MCP server (~/.claude.json) that spawns a
+  # `claude-channel-server` node process as a direct child of the session's
+  # `claude` process. Check for that child instead of matching stale banner
+  # text, or every launchd watchdog cycle would misreport a healthy bridge
+  # as failed.
+  # `env -u ... claude ...` execs claude in place of env, so the tmux
+  # pane's own pid IS the claude process (no intermediate shell/wrapper pid
+  # to hop through) — confirmed via `ps -o pid,ppid,command`.
+  local pane_pid
+  pane_pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null)"
+  if [[ -n "$pane_pid" ]] && pgrep -P "$pane_pid" -f "claude-channel-server" >/dev/null 2>&1; then
     echo "bridge up: iMessage channel connected (tmux: $SESSION)"
   else
-    echo "bridge started but channel banner not seen — check: tmux attach -t $SESSION"
+    echo "bridge started but claude-channel-server child not seen — check: tmux attach -t $SESSION"
     return 1
   fi
 }
@@ -38,10 +60,79 @@ status() {
   fi
 }
 
+# --- launchd watchdog ---------------------------------------------------
+#
+# Design note: this is deliberately a WATCHDOG, not a KeepAlive daemon.
+#
+# tmux sessions are not the kind of process launchd's KeepAlive was built
+# for — the "process" launchd would supervise is the tmux server, but the
+# actual unit of work (the Claude Code session inside the `imessage-bridge`
+# tmux session) can die or be killed independently of tmux itself, and tmux
+# panes can be attached/detached/rearranged by the user at any time.
+# KeepAlive=true would fight that: it supervises a process (or watches a
+# path), not "is my named tmux session present with a live pane." A tight
+# KeepAlive loop restarting the wrong thing (or restarting mid-attach) would
+# be worse than the bridge being down.
+#
+# So instead: RunAtLoad fires once at login/load, and StartInterval reruns
+# the job every 5 minutes. Each run calls `bridge start`, which is already
+# idempotent — it checks `tmux has-session` first and exits 0 immediately
+# if the bridge is already up. Only when the session is truly absent does
+# it do the (slow, ~8s) work of creating it. This gives reboot-survival and
+# self-healing after a tmux-server crash without launchd fighting tmux's
+# own lifecycle.
+install_launchd() {
+  mkdir -p "$LOG_DIR"
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>${SELF} start || osascript -e 'display notification "handsfree bridge failed" with title "launchd"'</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>KeepAlive</key>
+    <false/>
+    <key>TimeoutSeconds</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/bridge.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/bridge.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/samzoloth/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+  launchctl unload "$PLIST_PATH" 2>/dev/null
+  launchctl load "$PLIST_PATH"
+  echo "installed + loaded: $PLIST_PATH (watchdog every 300s, RunAtLoad on)"
+}
+
+uninstall_launchd() {
+  launchctl unload "$PLIST_PATH" 2>/dev/null
+  rm -f "$PLIST_PATH"
+  echo "unloaded + removed: $PLIST_PATH"
+}
+
 case "${1:-status}" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) stop; sleep 1; start ;;
-  status)  status ;;
-  *) echo "usage: bridge start|stop|restart|status"; exit 1 ;;
+  start)             start ;;
+  stop)               stop ;;
+  restart)            stop; sleep 1; start ;;
+  status)             status ;;
+  install-launchd)    install_launchd ;;
+  uninstall-launchd)  uninstall_launchd ;;
+  *) echo "usage: bridge start|stop|restart|status|install-launchd|uninstall-launchd"; exit 1 ;;
 esac

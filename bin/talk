@@ -17,9 +17,33 @@ if [[ -n "$PROMPT" ]]; then
 fi
 
 # Fast path: bridge session is alive and its prompt is empty (never clobber a draft).
-# The REPL renders "❯" + non-breaking space when empty; a draft adds alphanumerics.
+#
+# The REPL renders "❯" + non-breaking space when empty; a real draft adds
+# plain-color alphanumerics after it. But Claude Code also renders a
+# *suggested* next prompt in the same spot after a turn ends (the
+# --prompt-suggestions feature) — dim/grey ghost text that is NOT in the
+# input buffer (confirmed 2026-07-14: typing overwrites it instantly, and
+# it reappears after clearing). A plain-text grep can't tell a ghost
+# suggestion from a real draft, so it always sees "non-empty" and falls
+# through to the slow cold path below — silently, on nearly every turn,
+# since a suggestion appears after almost every response. That defeats the
+# whole point of the warm-bridge fast path. Capture with -e (keep ANSI
+# codes) and treat a prompt line as empty when nothing follows it, or when
+# everything that follows is wrapped in the dim SGR span (\x1b[2m) real
+# typed text never carries.
 if tmux has-session -t "$BRIDGE_SESSION" 2>/dev/null; then
-  if tmux capture-pane -t "$BRIDGE_SESSION" -p | grep -qE '^❯[^A-Za-z0-9]*$'; then
+  BRIDGE_IDLE=$(tmux capture-pane -t "$BRIDGE_SESSION" -p -e | python3 -c '
+import re, sys
+lines = sys.stdin.read().splitlines()
+prompt_lines = [l for l in lines if "❯" in l]  # ❯
+if not prompt_lines:
+    print("0"); sys.exit()
+last = prompt_lines[-1]
+m = re.search(r"❯\xa0?(.*)$", last)
+rest = (m.group(1) if m else "").strip("\xa0 ")
+print("1" if (rest == "" or rest.startswith("\x1b[2m")) else "0")
+')
+  if [[ "$BRIDGE_IDLE" == "1" ]]; then
     tmux send-keys -t "$BRIDGE_SESSION" "$VOICE_CMD"
     sleep 0.4   # let the REPL's paste detection settle, else Enter is swallowed
     tmux send-keys -t "$BRIDGE_SESSION" Enter
