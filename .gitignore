@@ -5,4 +5,11 @@ plans/
 # daemon.py's first-run auto-download; nothing here is hand-authored.
 wakeword/.venv/
 wakeword/models/
-wakeword/__pycache__/
+
+# barge-in: swift build products + python caches
+.build/
+.venv/
+.uv-cache/
+.pytest_cache/
+__pycache__/
+*.pyc
