@@ -2,16 +2,22 @@
 """Local wake-word daemon: mic -> openWakeWord -> ~/.local/bin/talk.
 
 Listens continuously on the default input device for the wake phrase and,
-on detection, invokes the existing `talk` warm path (which itself prefers
-the persistent imessage-bridge tmux session when it's up). This drops the
-"Hey Siri, talk to Claude" hop for anyone at the machine.
+on detection, invokes the existing `talk` warm path -- but only when the
+persistent imessage-bridge tmux session actually exists (see
+`bridge_session_exists`) and isn't already mid-conversation (see
+`conversation_presumed_active`). This drops the "Hey Siri, talk to Claude"
+hop for anyone at the machine without being able to spawn an unbounded
+headless session on a false positive, or stack a second trigger on top of
+an ongoing one.
 
 Usage:
     daemon.py [--model PATH] [--threshold 0.5] [--cooldown 120]
               [--dry-run] [--device NAME_OR_INDEX] [--log-path PATH]
+              [--bridge-session NAME] [--lock-ttl 15]
 
 See wakeword/README.md for the model choice, the onnxruntime-vs-tflite
-gotcha this file works around, and the custom-model upgrade path.
+gotcha this file works around, the bounded-trigger design, and the
+custom-model upgrade path.
 """
 
 from __future__ import annotations
@@ -19,9 +25,12 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
+import os
 import queue
+import re
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -67,9 +76,21 @@ MODELS_DIR = WAKEWORD_DIR / "models"
 DEFAULT_MODEL_NAME = "hey_jarvis"
 DEFAULT_TALK_BIN = Path.home() / ".local" / "bin" / "talk"
 DEFAULT_LOG_PATH = Path.home() / ".local" / "state" / "handsfree" / "wakeword.log"
+DEFAULT_LOCK_PATH = Path.home() / ".local" / "state" / "handsfree" / "wakeword.trigger.lock"
+
+# Matches bin/talk's TALK_BRIDGE_SESSION env var so both pieces stay in
+# sync if Sam ever renames the bridge session.
+DEFAULT_BRIDGE_SESSION = os.environ.get("TALK_BRIDGE_SESSION", "imessage-bridge")
 
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 1280  # 80ms at 16kHz -- openWakeWord's native chunk size
+
+# How often to re-check the bridge pane's busy/idle state via `tmux
+# capture-pane` while suppressing detection (blocker: self-trigger guard).
+# A subprocess spawn every 80ms frame would be wasteful and could itself
+# eat into the CPU budget; once a second is frequent enough that a
+# conversation ending is noticed promptly without hammering tmux.
+BRIDGE_BUSY_CHECK_INTERVAL = 1.0
 
 
 def ensure_model_files(model_name: str) -> tuple[Path, Path, Path]:
@@ -97,6 +118,129 @@ def setup_logging(log_path: Path) -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+# --- bounded trigger path ---------------------------------------------------
+#
+# Three separate guards, all of which must clear before `talk` is invoked:
+#
+# 1. bridge_session_exists() -- the tmux session that backs the warm path
+#    must actually be up. If it isn't, we do NOT fall through to a cold
+#    `claude -p` spawn on a wake-word false positive (that was the
+#    unbounded-spawn risk flagged in review) -- we notify and stop.
+# 2. conversation_presumed_active() -- a short-TTL lock file written at the
+#    moment of trigger (covers the race between invoking talk and the
+#    bridge pane visibly going busy) OR the bridge pane already showing a
+#    non-idle prompt (covers a long-running conversation, including one
+#    the cooldown timer has already expired during). Either signal being
+#    true means: don't even score this frame, let alone trigger.
+# 3. the ordinary cooldown timer, for everything the above two don't cover
+#    (repeated benign wake-word hits shortly after a completed trigger).
+def bridge_session_exists(session: str) -> bool:
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def bridge_is_busy(session: str) -> bool:
+    """True if the bridge tmux pane's prompt is non-empty (a turn is in flight).
+
+    Ports bin/talk's BRIDGE_IDLE detection verbatim in spirit: the REPL
+    renders an empty prompt as "❯" with nothing (or only a non-breaking
+    space) after it, or a dim/grey *suggested* next prompt (ANSI SGR
+    \\x1b[2m) that is not real input. Anything else after the prompt marker
+    means Claude is mid-turn -- a voicemode converse call, a long response
+    rendering, etc. -- which is exactly the self-trigger window this exists
+    to detect: the assistant's own Kokoro voice leaking into the mic must
+    not be able to re-trigger `talk` just because the fixed cooldown timer
+    happened to expire while that turn was still running.
+
+    Fails closed *given a session that exists*: any error talking to tmux
+    (timeout, session vanished mid-check, no prompt line found at all) is
+    treated as busy, so an unreadable pane suppresses a trigger rather than
+    risking a stacked one.
+
+    Deliberately NOT fail-closed when the session doesn't exist at all --
+    "busy" means "a conversation is in flight," and there's nothing in
+    flight if there's no bridge session. Treating "absent" as "busy" would
+    permanently suppress scoring (and therefore detection) any time the
+    bridge is down, which defeats the whole point of the bounded-trigger
+    path: a wake word heard while the bridge is down needs to actually be
+    scored so it can produce the "bridge is down" notification, not get
+    silently discarded here first. `bridge_session_exists()` at the actual
+    trigger point is what decides whether to invoke `talk` vs. notify.
+    """
+    if not bridge_session_exists(session):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session, "-p", "-e"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+    if result.returncode != 0:
+        return True
+
+    lines = result.stdout.splitlines()
+    prompt_lines = [line for line in lines if "❯" in line]
+    if not prompt_lines:
+        return True
+
+    match = re.search(r"❯\xa0?(.*)$", prompt_lines[-1])
+    rest = (match.group(1) if match else "").strip("\xa0 ")
+    idle = rest == "" or rest.startswith("\x1b[2m")
+    return not idle
+
+
+class BridgeBusyMonitor:
+    """Caches bridge_is_busy() so the main loop isn't spawning `tmux
+    capture-pane` on every 80ms audio frame."""
+
+    def __init__(self, session: str, check_interval: float = BRIDGE_BUSY_CHECK_INTERVAL) -> None:
+        self.session = session
+        self.check_interval = check_interval
+        self._value = False
+        self._checked_at = 0.0
+
+    def is_busy(self) -> bool:
+        now = time.monotonic()
+        if now - self._checked_at >= self.check_interval:
+            self._value = bridge_is_busy(self.session)
+            self._checked_at = now
+        return self._value
+
+
+def trigger_lock_active(lock_path: Path, ttl_seconds: float) -> bool:
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return age < ttl_seconds
+
+
+def write_trigger_lock(lock_path: Path) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(datetime.datetime.now(datetime.timezone.utc).isoformat())
+
+
+def notify_bridge_down(score: float, dry_run: bool) -> None:
+    logging.warning("detection score=%.3f but bridge is down -- not spawning a cold session", score)
+    if dry_run:
+        logging.info("[dry-run] would post macOS notification (bridge down)")
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'display notification "wake word heard but bridge is down" with title "handsfree"'],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except OSError as exc:
+        logging.error("failed to post notification: %s", exc)
 
 
 def trigger_talk(talk_bin: Path, dry_run: bool) -> None:
@@ -135,8 +279,10 @@ def run(args: argparse.Namespace) -> int:
     model_label = wakeword_path.stem  # e.g. "hey_jarvis_v0.1"
 
     logging.info(
-        "starting wakeword daemon: model=%s threshold=%.2f cooldown=%ss dry_run=%s device=%s",
+        "starting wakeword daemon: model=%s threshold=%.2f cooldown=%ss dry_run=%s device=%s "
+        "bridge_session=%s lock_ttl=%ss",
         model_label, args.threshold, args.cooldown, args.dry_run, args.device or "default",
+        args.bridge_session, args.lock_ttl,
     )
 
     oww_model = Model(
@@ -154,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
         audio_q.put(indata[:, 0].copy())
 
     last_trigger: datetime.datetime | None = None
+    busy_monitor = BridgeBusyMonitor(args.bridge_session)
 
     try:
         stream = sd.InputStream(
@@ -178,20 +325,47 @@ def run(args: argparse.Namespace) -> int:
         logging.info("listening")
         while True:
             chunk = audio_q.get()
-            prediction = oww_model.predict(chunk)
+
+            # Self-trigger guard: while a conversation is presumed active
+            # (fresh trigger lock, or the bridge pane itself shows a
+            # non-idle prompt), don't even score this frame. This is the
+            # actual guard against the assistant's own Kokoro voice
+            # re-triggering wake-word detection mid-conversation -- NOT an
+            # assumption that Bluetooth echo-cancellation handles it
+            # upstream of the mic. See "Self-trigger guard" in README.
+            if trigger_lock_active(args.lock_path, args.lock_ttl) or busy_monitor.is_busy():
+                continue
+
+            try:
+                prediction = oww_model.predict(chunk)
+            except Exception:
+                logging.exception("prediction failed on this frame -- skipping")
+                continue
+
             score = float(prediction.get(model_label, 0.0))
+            if score < args.threshold:
+                continue
 
-            if score >= args.threshold:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                in_cooldown = last_trigger is not None and (now - last_trigger).total_seconds() < args.cooldown
-                if in_cooldown:
-                    remaining = args.cooldown - (now - last_trigger).total_seconds()
-                    logging.info("detection score=%.3f suppressed (cooldown, %.0fs remaining)", score, remaining)
-                    continue
+            now = datetime.datetime.now(datetime.timezone.utc)
+            in_cooldown = last_trigger is not None and (now - last_trigger).total_seconds() < args.cooldown
+            if in_cooldown:
+                remaining = args.cooldown - (now - last_trigger).total_seconds()
+                logging.info("detection score=%.3f suppressed (cooldown, %.0fs remaining)", score, remaining)
+                continue
 
-                logging.info("detection score=%.3f -- triggering talk", score)
-                trigger_talk(args.talk_bin, args.dry_run)
-                last_trigger = now
+            # Bounded trigger path: only ever invoke `talk` when the warm
+            # bridge actually exists. A wake-word false positive with the
+            # bridge down must not fall through to an unbounded cold
+            # `claude -p` spawn -- notify instead and stop here.
+            if not bridge_session_exists(args.bridge_session):
+                notify_bridge_down(score, args.dry_run)
+                last_trigger = now  # still starts cooldown, so a noisy false-positive can't spam notifications
+                continue
+
+            logging.info("detection score=%.3f -- triggering talk", score)
+            write_trigger_lock(args.lock_path)
+            trigger_talk(args.talk_bin, args.dry_run)
+            last_trigger = now
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -202,10 +376,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--threshold", type=float, default=0.5, help="Detection score threshold (default: 0.5)")
     parser.add_argument("--cooldown", type=float, default=120, help="Seconds to suppress re-trigger after a detection (default: 120)")
-    parser.add_argument("--dry-run", action="store_true", help="Log detections but do not invoke talk")
+    parser.add_argument("--dry-run", action="store_true", help="Log detections but do not invoke talk or post notifications")
     parser.add_argument("--device", default=None, help="Input device name or index (default: system default input)")
     parser.add_argument("--talk-bin", type=Path, default=DEFAULT_TALK_BIN, help=f"Path to invoke on detection (default: {DEFAULT_TALK_BIN})")
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH, help=f"Log file path (default: {DEFAULT_LOG_PATH})")
+    parser.add_argument(
+        "--bridge-session", default=DEFAULT_BRIDGE_SESSION,
+        help=f"tmux session name for the warm bridge (default: {DEFAULT_BRIDGE_SESSION}, or $TALK_BRIDGE_SESSION)",
+    )
+    parser.add_argument(
+        "--lock-path", type=Path, default=DEFAULT_LOCK_PATH,
+        help=f"Trigger lock file path (default: {DEFAULT_LOCK_PATH})",
+    )
+    parser.add_argument(
+        "--lock-ttl", type=float, default=15,
+        help="Seconds the trigger lock suppresses detection after invoking talk, bridging the gap "
+             "before the bridge pane visibly shows busy (default: 15)",
+    )
     return parser.parse_args(argv)
 
 
