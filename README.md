@@ -69,6 +69,9 @@ prompts, one iPhone setting).
 | `bridge start/stop/status` | Manage the persistent session |
 | `bridge install-launchd` | One-time: bridge survives reboot (watchdog checks every 5 min) |
 | Say "goodbye" / "stop" | Voice loop ends cleanly |
+| "Hey Jarvis" (mic always listening) | Local wake word triggers `talk`, no Siri hop — see `wakeword/README.md` |
+| `wakeword start/stop/status` | Manage the wake-word daemon |
+| `wakeword install-launchd` | One-time: wake-word daemon survives reboot (KeepAlive) |
 
 ## Behavior contracts
 
@@ -125,8 +128,13 @@ every voice note, and a hard human gate on anything outbound.
 1. **Barge-in** — interrupt the assistant mid-speech (needs a custom mic loop;
    VoiceMode doesn't support it upstream). The biggest remaining gap between
    "demo" and "human."
-2. **Local wake word** ("Claude?") via openWakeWord → `talk`, dropping the
-   Siri hop.
+2. ~~Local wake word ("Claude?") via openWakeWord → `talk`, dropping the
+   Siri hop.~~ Built 2026-07-14 with `hey jarvis` (`wakeword start` /
+   `wakeword install-launchd`, see `wakeword/README.md`) — the offline
+   detection pipeline is verified correct (0.94–0.9999 on true positives),
+   but live speaker-to-mic verification was interrupted mid-session and
+   needs one manual re-run; see the "Verification status" section of
+   `wakeword/README.md` for exactly what's left and why.
 3. ~~launchd auto-start for the bridge so the warm brain survives reboots.~~
    Done 2026-07-14: `bridge install-launchd` (see Use table below).
 4. **Streaming TTS** so long reads begin speaking on the first sentence.
