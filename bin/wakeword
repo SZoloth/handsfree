@@ -1,0 +1,155 @@
+#!/bin/zsh
+# Local wake-word daemon control — mic -> openWakeWord -> `talk`, no Siri hop.
+#
+# Unlike `bridge` (a watchdog around a tmux session), this one IS a resident
+# process: launchd's KeepAlive=true is the correct model here since the unit
+# of work is a single always-running python process, not a tmux pane a human
+# might attach/detach/rearrange.
+#
+# Usage: wakeword start|stop|restart|status|install-launchd|uninstall-launchd
+
+# Resolve this script's absolute path so paths below are correct no matter
+# what directory `wakeword` was invoked from (mirrors bin/bridge).
+SELF="${0:A}"
+BIN_DIR="${SELF:h}"
+REPO_DIR="${BIN_DIR:h}"
+WAKEWORD_DIR="$REPO_DIR/wakeword"
+VENV_PY="$WAKEWORD_DIR/.venv/bin/python3"
+DAEMON="$WAKEWORD_DIR/daemon.py"
+
+STATE_DIR="$HOME/.local/state/handsfree"
+LOG_PATH="$STATE_DIR/wakeword.log"
+LOG_DIR="$HOME/Library/Logs/handsfree"
+
+PLIST_LABEL="com.handsfree.wakeword"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+
+COOLDOWN="${WAKEWORD_COOLDOWN:-120}"
+THRESHOLD="${WAKEWORD_THRESHOLD:-0.5}"
+
+mkdir -p "$STATE_DIR"
+
+# Single source of truth for "is it running": pgrep on the daemon's own
+# script path, not a self-maintained pidfile. This way `status` reports
+# correctly whether the process was started by hand or by launchd — no
+# split-brain between two different liveness mechanisms (same reasoning as
+# bridge's tmux-has-session check).
+running_pid() {
+  pgrep -f "$DAEMON" 2>/dev/null | head -1
+}
+
+start() {
+  local pid
+  pid="$(running_pid)"
+  if [[ -n "$pid" ]]; then
+    echo "wakeword already running (pid $pid)"
+    return 0
+  fi
+  mkdir -p "$LOG_DIR"
+  nohup "$VENV_PY" "$DAEMON" --cooldown "$COOLDOWN" --threshold "$THRESHOLD" \
+    >> "$LOG_DIR/wakeword.out.log" 2>> "$LOG_DIR/wakeword.err.log" &
+  disown
+  sleep 1
+  pid="$(running_pid)"
+  if [[ -n "$pid" ]]; then
+    echo "wakeword started (pid $pid)"
+  else
+    echo "wakeword failed to start — check $LOG_DIR/wakeword.err.log"
+    return 1
+  fi
+}
+
+stop() {
+  local pid
+  pid="$(running_pid)"
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null
+    echo "wakeword stopped (was pid $pid)"
+  else
+    echo "wakeword not running"
+  fi
+}
+
+status() {
+  local pid
+  pid="$(running_pid)"
+  if [[ -n "$pid" ]]; then
+    echo "wakeword running (pid $pid)"
+  else
+    echo "wakeword not running"
+  fi
+  if [[ -f "$LOG_PATH" ]]; then
+    echo "--- last detections ($LOG_PATH) ---"
+    tail -5 "$LOG_PATH"
+  fi
+}
+
+# --- launchd resident daemon --------------------------------------------
+#
+# KeepAlive=true is deliberate here (unlike bridge's watchdog): the process
+# launchd supervises IS the unit of work — a single python process holding
+# the mic stream open — so there's no tmux-pane-vs-session ambiguity for
+# launchd to fight. If it dies (mic error, crash, `kill`), launchd restarts
+# it immediately. The `||` alert fires on every non-zero exit before that
+# restart happens, per house rule on launchd failure alerting.
+install_launchd() {
+  mkdir -p "$LOG_DIR"
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>${VENV_PY} ${DAEMON} --cooldown ${COOLDOWN} --threshold ${THRESHOLD} || osascript -e 'display notification "handsfree wakeword daemon exited" with title "launchd"'</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>TimeoutSeconds</key>
+    <integer>60</integer>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/wakeword.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/wakeword.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/samzoloth/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+  # If a manually-started instance is running, stop it first — launchd
+  # owns the process from here on, and two mic streams fighting over the
+  # same input device is worse than either alone.
+  local pid
+  pid="$(running_pid)"
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && sleep 1
+  launchctl unload "$PLIST_PATH" 2>/dev/null
+  launchctl load "$PLIST_PATH"
+  echo "installed + loaded: $PLIST_PATH (KeepAlive, RunAtLoad on)"
+}
+
+uninstall_launchd() {
+  launchctl unload "$PLIST_PATH" 2>/dev/null
+  rm -f "$PLIST_PATH"
+  echo "unloaded + removed: $PLIST_PATH"
+}
+
+case "${1:-status}" in
+  start)             start ;;
+  stop)               stop ;;
+  restart)            stop; sleep 1; start ;;
+  status)             status ;;
+  install-launchd)    install_launchd ;;
+  uninstall-launchd)  uninstall_launchd ;;
+  *) echo "usage: wakeword start|stop|restart|status|install-launchd|uninstall-launchd"; exit 1 ;;
+esac
