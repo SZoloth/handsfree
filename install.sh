@@ -91,6 +91,9 @@ else
 fi
 
 say_step "Manual steps that remain"
+# EOF is intentionally unquoted so the absolute $REPO path is expanded into
+# the printed probe command. Keep this body free of backticks, $(), and other
+# shell substitutions unless their execution here is deliberate.
 cat <<EOF
   1. Add the two contracts from contracts/voice-contracts.md to ~/CLAUDE.md
      (edit the phone number placeholder). They govern how Claude behaves by

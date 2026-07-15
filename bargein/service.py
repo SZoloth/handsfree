@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Awaitable, Callable
 
-import httpx
-
 from .audio_helper import HelperPlayback, HelperUnavailable
 from .session import BargeInSession
 from .tts import KokoroClient
@@ -47,11 +45,15 @@ class SpeakAndListenService:
             )
             result = await session.run(pcm, message=message, voice=voice, speed=speed, **kwargs)
             return result.listen_result or "No speech was captured."
-        except (HelperUnavailable, ImportError, httpx.HTTPError) as error:
-            # The helper may have failed after opening the mic. Close it before
-            # VoiceMode is allowed to play or capture through PortAudio.
-            await playback.close_mic()
-            logger.warning("barge-in helper unavailable; using half-duplex fallback: %s", error)
+        except Exception as error:
+            # Protocol failures include malformed JSON, unknown message types,
+            # truncated frames, and future helper errors we do not recognize.
+            # Always release helper-owned audio before VoiceMode opens PortAudio.
+            try:
+                await playback.close_mic()
+            except Exception as cleanup_error:
+                logger.warning("barge-in helper cleanup failed: %s", cleanup_error)
+            logger.warning("barge-in unavailable; using half-duplex fallback: %s", error)
             return await self.converse(
                 message=message,
                 voice=voice,

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import dataclasses
 import json
 import os
+import signal
 import struct
+import threading
+import time
 import wave
 from io import BytesIO
 from pathlib import Path
@@ -12,6 +16,73 @@ from typing import Awaitable, Callable
 
 from .protocol import HEADER, MessageType, encode_frame
 from .session import PlaybackResult
+
+
+_LIVE_HELPER_GROUPS: set[int] = set()
+_LIVE_HELPER_GROUPS_LOCK = threading.Lock()
+_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _signal_helper_group(process_group: int, signal_number: int) -> None:
+    try:
+        os.killpg(process_group, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def _terminate_live_helper_groups(*, force: bool = False) -> None:
+    with _LIVE_HELPER_GROUPS_LOCK:
+        process_groups = tuple(_LIVE_HELPER_GROUPS)
+    for process_group in process_groups:
+        _signal_helper_group(process_group, signal.SIGTERM)
+
+    if not process_groups:
+        return
+    if not force:
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            if all(not _helper_group_exists(group) for group in process_groups):
+                return
+            time.sleep(0.01)
+    for process_group in process_groups:
+        _signal_helper_group(process_group, signal.SIGKILL)
+
+
+def _helper_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _install_signal_cleanup_handlers() -> None:
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    try:
+        for signal_number in (signal.SIGINT, signal.SIGTERM):
+            previous = signal.getsignal(signal_number)
+
+            def cleanup_handler(signum, frame, previous_handler=previous):
+                _terminate_live_helper_groups(force=True)
+                if callable(previous_handler):
+                    previous_handler(signum, frame)
+                elif previous_handler == signal.SIG_IGN:
+                    return
+                else:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+
+            signal.signal(signal_number, cleanup_handler)
+    except ValueError:
+        # Signal handlers can only be installed from Python's main thread. The
+        # atexit guard still covers embedded/non-main-thread use.
+        return
+    _SIGNAL_HANDLERS_INSTALLED = True
+
+
+atexit.register(_terminate_live_helper_groups)
 
 
 class HelperUnavailable(RuntimeError):
@@ -59,6 +130,7 @@ class HelperPlayback:
     async def _start(self) -> None:
         if not self.helper_path.is_file():
             raise HelperUnavailable(f"audio helper is missing: {self.helper_path}")
+        _install_signal_cleanup_handlers()
         try:
             self.process = await asyncio.create_subprocess_exec(
                 str(self.helper_path),
@@ -66,9 +138,12 @@ class HelperPlayback:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError as error:
             raise HelperUnavailable(f"audio helper could not start: {error}") from error
+        with _LIVE_HELPER_GROUPS_LOCK:
+            _LIVE_HELPER_GROUPS.add(self.process.pid)
 
     async def _read_frame(self) -> tuple[MessageType, bytes]:
         if self.process is None or self.process.stdout is None:
@@ -119,6 +194,10 @@ class HelperPlayback:
                     return PlaybackResult(interrupted=True, stopped_at=self.stop_called_at)
                 if name == "error":
                     raise HelperUnavailable(event.get("message", "unknown helper error"))
+                if name == "helper_unavailable":
+                    raise HelperUnavailable(
+                        event.get("message", "audio helper became unavailable")
+                    )
 
     async def stop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -131,16 +210,25 @@ class HelperPlayback:
     async def close_mic(self) -> None:
         if self.process is None:
             return
-        if self.process.returncode is None and self.process.stdin is not None:
-            try:
-                self.process.stdin.write(encode_frame(MessageType.SHUTDOWN))
-                await self.process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                self.process.terminate()
-                await self.process.wait()
-        self.process = None
-        self.output_owned = False
+        process = self.process
+        try:
+            if process.returncode is None and process.stdin is not None:
+                try:
+                    process.stdin.write(encode_frame(MessageType.SHUTDOWN))
+                    await process.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    _signal_helper_group(process.pid, signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=1)
+                    except asyncio.TimeoutError:
+                        _signal_helper_group(process.pid, signal.SIGKILL)
+                        await process.wait()
+        finally:
+            with _LIVE_HELPER_GROUPS_LOCK:
+                _LIVE_HELPER_GROUPS.discard(getattr(process, "pid", -1))
+            self.process = None
+            self.output_owned = False

@@ -17,10 +17,12 @@ swift build -c release
 .build/release/handsfree-audio-helper --probe
 ```
 
-The probe must print JSON with both `voice_processing_input` and
-`voice_processing_output` set to `true`. The first run may open macOS System
-Settings. If prompted, click **Allow** for microphone access, then rerun the
-probe. Do not continue with a probe that reports either flag as false.
+The probe must print `engine created`, both voice-processing enablement lines,
+`engine started`, `mic frame received`, and final JSON with
+`voice_processing_input` and `voice_processing_output` set to `true`. The first
+run may open macOS System Settings. If prompted, click **Allow** for microphone
+access, then rerun the probe. A stalled probe prints its last step and exits
+nonzero after 10 seconds. Do not continue with a timeout or a false flag.
 
 ## 1. Cut-off test — MANUAL
 
@@ -73,7 +75,21 @@ log show --last 30m --style compact \
 Pass when there are no device-busy or microphone-permission failures. Those
 errors mean the helper mic tap did not close before VoiceMode opened its mic.
 
-## 7. iMessage voice-note regression — AUTOMATED
+## 7. Mid-conversation audio-device switch — MANUAL
+
+1. Start a multi-sentence assistant response through the built-in speakers.
+2. While it is speaking, switch macOS output to AirPods or another device.
+3. Pass when the active helper stops, the tool call completes through plain
+   VoiceMode without a protocol error, and no `handsfree-audio-helper` process
+   remains after the turn.
+4. Start another turn. Pass when the fresh helper uses the newly selected
+   route. Switch back to the built-in route and repeat once.
+
+This step characterizes Bluetooth profile changes as well as a simple wired or
+built-in device switch. The interrupted turn is expected to lose barge-in and
+use the half-duplex fallback.
+
+## 8. iMessage voice-note regression — AUTOMATED
 
 With Kokoro and Whisper running, execute:
 
@@ -85,7 +101,7 @@ The final check synthesizes through Kokoro and transcribes through Whisper. It
 prints `OK: Kokoro to Whisper round trip`. The script skips this one check when
 either service is down; start the services and rerun before signing off.
 
-## 8. Daemon-down fallback — AUTOMATED + MANUAL
+## 9. Daemon-down fallback — AUTOMATED + MANUAL
 
 The automated test proves that a helper crash closes its microphone before the
 plain VoiceMode call:
@@ -113,6 +129,7 @@ Quiet interrupts: __/10
 Self-interrupts: __/6
 Noisy-room notes:
 20-turn device errors:
+Mid-turn device-switch result:
 Fallback result:
 First-word clipping notes:
 ```
