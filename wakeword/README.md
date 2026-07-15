@@ -179,8 +179,14 @@ def bridge_session_exists(session: str) -> bool:
 
 
 def bridge_is_busy(session: str) -> bool:
-    """Fails closed: any error talking to tmux, or no prompt line found,
-    is treated as busy."""
+    """Fails closed *given a session that exists*: any error talking to
+    tmux, or no prompt line found, is treated as busy. Deliberately NOT
+    fail-closed when the session doesn't exist at all — treating "absent"
+    as "busy" would permanently suppress scoring while the bridge is down,
+    which would silently swallow the "bridge is down" notification path.
+    """
+    if not bridge_session_exists(session):
+        return False
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", session, "-p", "-e"],

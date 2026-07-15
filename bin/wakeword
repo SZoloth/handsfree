@@ -76,8 +76,13 @@ stop() {
   local did_something=0
 
   if is_launchd_loaded; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null
-    echo "unloaded launchd job: $PLIST_LABEL (this also stops the running process)"
+    # -w persists the Disabled state: plain `unload` only removes the job
+    # from the running launchd session, and ~/Library/LaunchAgents is
+    # rescanned at every login — without -w, an always-on-mic daemon that
+    # the user explicitly stopped would silently resurrect at next login.
+    # install_launchd() uses `load -w` to clear the Disabled flag again.
+    launchctl unload -w "$PLIST_PATH" 2>/dev/null
+    echo "unloaded launchd job: $PLIST_LABEL (stops the process AND survives logins; run install-launchd to re-enable)"
     did_something=1
     sleep 1
   fi
@@ -162,7 +167,9 @@ PLIST
   pid="$(running_pid)"
   [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && sleep 1
   launchctl unload "$PLIST_PATH" 2>/dev/null
-  launchctl load "$PLIST_PATH"
+  # load -w clears any persisted Disabled flag left by `stop` (which uses
+  # `unload -w` so a stopped mic daemon stays stopped across logins).
+  launchctl load -w "$PLIST_PATH"
   echo "installed + loaded: $PLIST_PATH (KeepAlive, RunAtLoad on)"
 }
 
