@@ -32,6 +32,14 @@ uvx --from voice-mode voicemode config set VOICEMODE_KOKORO_DEFAULT_VOICE af_sky
 uvx --from voice-mode voicemode config set VOICEMODE_VOICES af_sky
 uvx --from voice-mode voicemode config set VOICEMODE_PREFER_LOCAL true
 uvx --from voice-mode voicemode config set VOICEMODE_AUTO_START_KOKORO true
+# Root-caused 2026-07-14: the default of 25 (voicemode's own memory-leak
+# mitigation for kokoro-fastapi, see github.com/hexgrad/kokoro/issues/152)
+# is exhausted by unrelated /api/health polling noise within 1-2 minutes,
+# and launchd's KeepAlive=true treats every resulting clean shutdown as a
+# crash and immediately restarts it — 1,058 restarts in 31 days serving
+# zero real TTS traffic. Raised so the mitigation still fires eventually
+# under real load, but health-check noise can't trigger a restart mid-session.
+uvx --from voice-mode voicemode config set VOICEMODE_KOKORO_MAX_REQUESTS 2000
 
 say_step "Starting services and enabling auto-start at login"
 uvx --from voice-mode voicemode service start whisper  || true
@@ -75,7 +83,13 @@ cat <<'EOF'
      voice and over iMessage.
   2. iMessage channel: inside a claude session run
         /plugin install imessage@claude-plugins-official
-     grant Full Disk Access when prompted, then: bridge start
+     grant Full Disk Access when prompted, then:
+        bridge start && bridge install-launchd
+     (install-launchd adds reboot survival: a launchd watchdog that
+     re-creates the bridge tmux session if it's ever absent, checked every
+     5 minutes. It's a plugin-install-gated manual step, not part of the
+     automated install above, because bridge start fails until the
+     iMessage plugin from step 2 is in place.)
   3. First mic use pops a macOS microphone permission prompt — click Allow.
   4. iPhone: Settings -> Notifications -> Announce Notifications -> Messages ON
      (makes bridge replies fully eyes-free on AirPods).

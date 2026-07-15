@@ -67,6 +67,7 @@ prompts, one iPhone setting).
 | "Hey Siri, talk to Claude" | Same, no terminal — works mid-cooking |
 | Text yourself from iPhone | Bridge acts and replies in the thread; long answers arrive as voice notes |
 | `bridge start/stop/status` | Manage the persistent session |
+| `bridge install-launchd` | One-time: bridge survives reboot (watchdog checks every 5 min) |
 | Say "goodbye" / "stop" | Voice loop ends cleanly |
 
 ## Behavior contracts
@@ -94,6 +95,30 @@ every voice note, and a hard human gate on anything outbound.
 5. **Whisper `base` (the default install) is not usable** for conversation:
    it truncates tails and hallucinates YouTube outros from silence.
    large-v3-turbo fixed both, still sub-second locally.
+6. **Kokoro's memory-leak mitigation crash-loops under unrelated traffic.**
+   VoiceMode sets `UVICORN_LIMIT_MAX_REQUESTS=25` by default (a real fix for
+   a real kokoro-fastapi leak — see hexgrad/kokoro#152) so the worker
+   recycles periodically. But *anything* hitting the port counts toward
+   that cap, including 404s — something on this machine polls a
+   nonexistent `/api/health` path (the real route is `/health`) at high
+   frequency, exhausting the 25-request budget in 1-2 minutes. launchd's
+   `KeepAlive=true` then treats every one of those clean, by-design uvicorn
+   shutdowns as a crash and restarts immediately: 1,058 restarts in 31 days
+   serving zero real synthesis. Fix: `VOICEMODE_KOKORO_MAX_REQUESTS=2000` in
+   `~/.voicemode/voicemode.env` (also set by `install.sh`), regenerated into
+   the launchd plist via `voicemode service enable kokoro` — never hand-edit
+   the installed plist directly, voicemode owns and regenerates it from this
+   template. The `/api/health` poller's source is still unidentified (not
+   voicemode or kokoro-fastapi — both only ever call `/health`).
+7. **A "suggested next prompt" looks identical to a real draft.** Claude
+   Code renders a dim/grey suggested-prompt ghost in the input box after
+   most turns (the `--prompt-suggestions` feature). It's not in the input
+   buffer — typing overwrites it instantly — but a plain-text scan of the
+   pane can't tell it apart from a real draft, so `bin/talk`'s "never
+   clobber a draft" fast-path guard saw it as non-empty almost every time
+   and silently fell back to the slow cold-boot path. Fixed by capturing
+   the pane with ANSI codes preserved (`tmux capture-pane -e`) and treating
+   text wrapped in the dim SGR span (`\x1b[2m`) as empty.
 
 ## Roadmap
 
@@ -102,5 +127,6 @@ every voice note, and a hard human gate on anything outbound.
    "demo" and "human."
 2. **Local wake word** ("Claude?") via openWakeWord → `talk`, dropping the
    Siri hop.
-3. **launchd auto-start for the bridge** so the warm brain survives reboots.
+3. ~~launchd auto-start for the bridge so the warm brain survives reboots.~~
+   Done 2026-07-14: `bridge install-launchd` (see Use table below).
 4. **Streaming TTS** so long reads begin speaking on the first sentence.
