@@ -132,9 +132,13 @@ every voice note, and a hard human gate on anything outbound.
    Siri hop.~~ Built 2026-07-14 with `hey jarvis` (`wakeword start` /
    `wakeword install-launchd`, see `wakeword/README.md`) — the offline
    detection pipeline is verified correct (0.94–0.9999 on true positives),
-   but live speaker-to-mic verification was interrupted mid-session and
-   needs one manual re-run; see the "Verification status" section of
-   `wakeword/README.md` for exactly what's left and why.
+   the trigger path is bounded (won't spawn a cold session if the bridge
+   is down) and self-trigger-guarded (won't stack a second `talk` on an
+   ongoing conversation, cooldown timer or not), and `wakeword stop`
+   actually stops it under launchd. Still open: live speaker-to-mic
+   verification, MANUAL — run the 5-minute checklist at the top of
+   `wakeword/README.md` (built-in mic + room speakers, not Bluetooth)
+   before `wakeword install-launchd`.
 3. ~~launchd auto-start for the bridge so the warm brain survives reboots.~~
    Done 2026-07-14: `bridge install-launchd` (see Use table below).
 4. **Streaming TTS** so long reads begin speaking on the first sentence.
