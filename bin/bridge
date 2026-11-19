@@ -111,7 +111,7 @@ install_launchd() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/samzoloth/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>/Users/samzoloth/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>
